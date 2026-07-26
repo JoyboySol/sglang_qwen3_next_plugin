@@ -64,6 +64,7 @@ description: Use when adding or reviewing support for a new SGLang version in th
 - `attn_output_gate` 默认值变化
 - projection bias 变化
 - `num_experts=0` 走普通 MLP
+- `mlp_only_layers` / `decoder_sparse_step` 逐层 dense/MoE MLP 判定
 
 这些逻辑只有在新上游已原生满足 checkpoint 结构时才能删除。
 
@@ -74,6 +75,7 @@ description: Use when adding or reviewing support for a new SGLang version in th
 - `layer_types` 保存与消费
 - `full_attention_interval` 推导问题
 - dtype 同步问题
+- Hybrid GDN / Mamba conv cache dtype 与模型实际 dtype 不一致
 - Hybrid backend / kernel 路径问题
 - 外部插件包发现机制
 
@@ -152,6 +154,7 @@ compat 必须单独放在：
 - 把环境 ABI 冲突误判成插件逻辑问题
 - 把 `0.5.2` 的 `sitecustomize/env_override` 当成所有版本都需要的公共主路径
 - 把 `0.5.2` 的 dtype patch 或 hybrid backend patch 默认继承到 `0.5.9+`，却不做真实服务验证
+- 只验证服务启动和 warmup，不发送真实 `/generate` 请求；YuLan-MoE 在 `0.5.9` 中就是首个真实请求才暴露 Mamba conv cache dtype mismatch
 - 更新了代码，但没更新 `progress.md` 和 `changelog.md`
 
 ## 当前仓库的已知事实
@@ -160,9 +163,24 @@ compat 必须单独放在：
 - `sglang 0.5.9` 的 `registry.py` 已原生消费 `SGLANG_EXTERNAL_MODEL_PACKAGE`
 - `0.5.9` 的配置签名虽然已有 `layer_types`，但仍需 compat 才能优先消费显式层布局
 - `.venv-sgl0_5_9` 曾因 `vllm 0.11.0` 与 `torch 2.9.1` ABI 冲突阻塞；卸载不兼容 `vllm` 后，最小插件接管与真实服务验收均恢复正常
-- 当前基于测试 checkpoint 的 `sglang 0.5.9` 完整验收命令为：
+- YuLan-MoE Hybrid GDN checkpoint 已暴露 `sglang 0.5.9` 仍需一个版本 compat：
+  - 服务将 checkpoint `torch.float32` downcast 为 `torch.float16`
+  - SGLang 0.5.9 的 Mamba conv cache 默认可能按 `bfloat16` 分配
+  - 首个真实 `/generate` 请求会触发 `conv_states_.scalar_type() == input_type`
+  - 当前修复放在 `compat/sglang_0_5_9.py`，patch `ModelRunnerKVCacheMixin.init_memory_pool()`，同步 `hf_config.dtype/torch_dtype` 并在用户未显式设置 `SGLANG_MAMBA_CONV_DTYPE` 时按 `model_config.dtype` 设置 conv cache dtype
+- YuLan-MoE Hybrid GDN checkpoint 还需要公共 custom：
+  - `mlp_only_layers=[0, 1]`
+  - `decoder_sparse_step=1`
+  - 第 0、1 层为普通 dense MLP，第 2 层起为 sparse MoE
+  - 不能只用全局 `num_experts > 0` 判断所有层都是 MoE
+- 当前基于 YuLan-MoE checkpoint 的 `sglang 0.5.9` 完整验收命令为：
+  - 启动服务：
+    - `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin python -m sglang.launch_server --model-path /root/nas/share/vc0e4b0o65t5/lvzhihao/PostTrain/models/hf_models/YuLan-MoE/hf/iter_0032780 --host 127.0.0.1 --port 30110 --tp 2 --trust-remote-code --disable-cuda-graph`
+  - 验收：
+    - `python scripts/run_acceptance.py --host 127.0.0.1 --port 30110`
+  - 结果为 `ALL CHECKS PASSED`
+- 历史基于测试 checkpoint 的 `sglang 0.5.9` 完整验收命令为：
   - `python scripts/run_acceptance.py --host 127.0.0.1 --port 30110`
   - 结果为 `ALL CHECKS PASSED`
-- 当前没有证据表明 `0.5.9` 仍需要继承 `0.5.2` 的：
-  - `ModelRunner.init_memory_pool()` dtype patch
-  - hybrid linear attention backend 强制切换 patch
+- 当前没有证据表明 `0.5.9` 仍需要继承 `0.5.2` 的 hybrid linear attention backend 强制切换 patch
+- 当前已有证据表明 `0.5.9` 需要自己的 Mamba conv cache dtype compat；不要把它误写成 `0.5.2` 的旧 `ModelRunner.init_memory_pool()` patch 原样继承

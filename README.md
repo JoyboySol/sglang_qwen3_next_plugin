@@ -74,7 +74,8 @@ python -m sglang.launch_server \
      - `sitecustomize.py` / `env_override.py` 接入层
    - `sglang 0.5.9`
      - `layer_types` compat
-     - 当前没有证据表明还需要继承 `0.5.2` 的 dtype patch 或 hybrid backend patch
+     - Hybrid GDN / Mamba conv cache dtype 同步
+     - 当前没有证据表明还需要继承 `0.5.2` 的 hybrid backend 强制切换 patch
 
 详细原因与升级复核点请看：
 
@@ -185,7 +186,7 @@ source /path/to/venv/bin/activate
 python scripts/run_acceptance.py --host 127.0.0.1 --port 30110
 ```
 
-当前 `sglang 0.5.9` 真实环境已实测返回 `ALL CHECKS PASSED`。
+当前 `sglang 0.5.9` 真实环境已实测返回 `ALL CHECKS PASSED`。YuLan-MoE Hybrid GDN checkpoint 在 `tp=2`、两张 H100 80GB 上完成真实启动、生成和 logprob 验收。
 
 ## 开发
 

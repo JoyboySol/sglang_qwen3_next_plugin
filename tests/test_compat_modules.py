@@ -23,3 +23,12 @@ def test_sglang_0_5_9_runtime_compat_contract() -> None:
     applied = compat.apply_runtime_compat()
 
     assert "layer_types" in applied
+    assert "mamba_conv_dtype" in applied
+
+    import sglang.srt.model_executor.model_runner_kv_cache_mixin as kv_cache_mixin_module
+
+    assert getattr(
+        kv_cache_mixin_module,
+        "_sglang_qwen3_next_plugin_mamba_conv_dtype_patch",
+        False,
+    )

@@ -70,6 +70,18 @@ from sglang_qwen3_next_plugin.compat.sglang_0_5_9 import apply_runtime_compat
 apply_runtime_compat()
 
 
+def _is_sparse_mlp_layer(config: Qwen3NextConfig, layer_id: int) -> bool:
+    if getattr(config, "num_experts", 0) <= 0:
+        return False
+    if layer_id in getattr(config, "mlp_only_layers", []):
+        return False
+
+    decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
+    if decoder_sparse_step <= 0:
+        raise ValueError(f"decoder_sparse_step must be positive: {decoder_sparse_step}")
+    return (layer_id + 1) % decoder_sparse_step == 0
+
+
 @triton.jit
 def fused_qkvzba_split_reshape_cat_kernel(
     mixed_qkv,
@@ -489,10 +501,15 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             config, layer_id, quant_config, alt_stream, prefix
         )
 
-        # Support non-MoE checkpoints with num_experts=0.
-        self.is_layer_sparse = getattr(config, "num_experts", 0) > 0
-        is_previous_layer_sparse = True
-        is_next_layer_sparse = True
+        # Follow HF Qwen3-Next MoE semantics for mixed dense/sparse checkpoints.
+        self.is_layer_sparse = _is_sparse_mlp_layer(config, layer_id)
+        is_previous_layer_sparse = (
+            layer_id > 0 and _is_sparse_mlp_layer(config, layer_id - 1)
+        )
+        is_next_layer_sparse = (
+            layer_id + 1 < config.num_hidden_layers
+            and _is_sparse_mlp_layer(config, layer_id + 1)
+        )
         self.layer_id = layer_id
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -659,10 +676,15 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-        # Support non-MoE checkpoints with num_experts=0.
-        self.is_layer_sparse = getattr(config, "num_experts", 0) > 0
-        is_previous_layer_sparse = True
-        is_next_layer_sparse = True
+        # Follow HF Qwen3-Next MoE semantics for mixed dense/sparse checkpoints.
+        self.is_layer_sparse = _is_sparse_mlp_layer(config, layer_id)
+        is_previous_layer_sparse = (
+            layer_id > 0 and _is_sparse_mlp_layer(config, layer_id - 1)
+        )
+        is_next_layer_sparse = (
+            layer_id + 1 < config.num_hidden_layers
+            and _is_sparse_mlp_layer(config, layer_id + 1)
+        )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,

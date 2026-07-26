@@ -1,5 +1,64 @@
 # SGLang Qwen3 Next Plugin 进度记录
 
+## 2026-07-23
+
+### YuLan-MoE Hybrid GDN 推理适配
+- 目标 checkpoint：
+  - `/root/nas/share/vc0e4b0o65t5/lvzhihao/PostTrain/models/hf_models/YuLan-MoE/hf/iter_0032780`
+- 已采集 checkpoint 结构事实：
+  - `architectures=["Qwen3NextForCausalLM"]`
+  - `model_type="qwen3_next"`
+  - `num_hidden_layers=56`
+  - 显式 `layer_types` 存在，`full_attention_interval=0`
+  - `num_experts=192`
+  - `num_experts_per_tok=4`
+  - `moe_intermediate_size=512`
+  - `shared_expert_intermediate_size=512`
+  - `mlp_only_layers=[0, 1]`
+  - `decoder_sparse_step=1`
+  - `attn_output_gate=False`
+  - `attention_bias=True`
+- 已采集当前 Python 环境事实：
+  - 仓库 `.venv`：`sglang==0.5.9`
+  - `torch==2.9.1+cu128`
+  - `flashinfer-python==0.6.3`
+  - `sgl-kernel==0.3.21`
+  - `pytest==9.1.1`
+  - 未安装 `vllm`；当前 `0.5.9` 路径不需要 `vllm._C`
+  - `registry.py` 原生消费 `SGLANG_EXTERNAL_MODEL_PACKAGE`
+  - GPU：2 张 H100 80GB
+- 已定位本 checkpoint 相对已有 YuLan Hybrid GDN 的新增结构差异：
+  - 前两层是普通 dense MLP，权重为 `mlp.gate_proj/up_proj/down_proj`
+  - 第 2 层起为 sparse MoE，权重包含 `mlp.gate`、`mlp.experts.*`、`mlp.shared_expert.*`、`mlp.shared_expert_gate`
+  - 旧 `0.5.9` 变体只按全局 `num_experts > 0` 判定所有层为 sparse，会把前两层错误建成 MoE
+- 已实施修复：
+  - `variants/sglang_0_5_9.py` 新增 `_is_sparse_mlp_layer()`，复用 HF Qwen3-Next 的逐层稀疏判定：
+    - `num_experts > 0`
+    - `layer_id not in mlp_only_layers`
+    - `(layer_id + 1) % decoder_sparse_step == 0`
+  - linear-attention decoder layer 与 full-attention decoder layer 均改为使用逐层 sparse 判定
+  - `LayerScatterModes` 的当前/前一/后一层 sparse 状态也改为逐层计算
+  - `compat/sglang_0_5_9.py` 新增 Hybrid GDN / Mamba conv cache dtype 同步：
+    - 服务将 checkpoint `torch.float32` downcast 为 `torch.float16`
+    - SGLang 0.5.9 的 `mamba2_state_dtype()` 默认会把 conv cache 建成 `bfloat16`
+    - 真实请求触发 `conv_states_.scalar_type() == input_type` 报错
+    - patch 在 `ModelRunnerKVCacheMixin.init_memory_pool()` 前同步 `hf_config.dtype/torch_dtype`，并在用户未显式设置 `SGLANG_MAMBA_CONV_DTYPE` 时按模型 dtype 设置 conv cache dtype
+- 当前分类结论：
+  - 新增逻辑属于 checkpoint 结构定制，不属于 `sglang 0.5.9` 运行时 compat
+  - dtype 同步属于 `sglang 0.5.9` 在 YuLan-MoE Hybrid GDN 上暴露出的运行时 compat
+  - `0.5.9` 仍没有新增 hybrid backend 强制切换 patch
+- 已完成验证：
+  - `python -m pytest tests/test_versioning.py -q`：`11 passed`
+  - `python -m pytest tests/test_dispatcher_exports.py tests/test_compat_modules.py tests/test_variant_0_5_9_source.py tests/test_versioning.py -q`：`23 passed`
+  - `python test_plugin.py`：通过
+  - `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin python scripts/check_plugin_import.py`：registry 解析到 `sglang_qwen3_next_plugin.variants.sglang_0_5_9`
+  - `python scripts/run_acceptance.py --skip-runtime`：`ALL CHECKS PASSED`
+  - 真实服务启动命令：
+    - `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin python -m sglang.launch_server --model-path /root/nas/share/vc0e4b0o65t5/lvzhihao/PostTrain/models/hf_models/YuLan-MoE/hf/iter_0032780 --host 127.0.0.1 --port 30110 --tp 2 --trust-remote-code --disable-cuda-graph`
+  - `python scripts/validate_generation.py --host 127.0.0.1 --port 30110 --max-new-tokens 8`：通过
+  - `python scripts/validate_logprob.py --host 127.0.0.1 --port 30110`：通过
+  - `python scripts/run_acceptance.py --host 127.0.0.1 --port 30110`：`ALL CHECKS PASSED`
+
 ## 2026-03-20
 
 ### Phase 0: 上下文恢复

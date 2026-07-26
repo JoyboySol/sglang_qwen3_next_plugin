@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import torch
+
 from sglang.srt.configs.qwen3_next import HybridLayerType, Qwen3NextConfig
+from sglang.srt.environ import envs
+import sglang.srt.model_executor.model_runner_kv_cache_mixin as kv_cache_mixin_module
 
 
 def _plugin_layers_block_type(config: Qwen3NextConfig):
@@ -34,6 +38,8 @@ def _plugin_layers_block_type(config: Qwen3NextConfig):
 
 
 def apply_runtime_compat() -> list[str]:
+    applied: list[str] = []
+
     if not getattr(Qwen3NextConfig, "_sglang_qwen3_next_plugin_layer_types_patch", False):
         original_init = Qwen3NextConfig.__init__
 
@@ -44,5 +50,41 @@ def apply_runtime_compat() -> list[str]:
         Qwen3NextConfig.__init__ = _patched_qwen3_next_config_init
         Qwen3NextConfig.layers_block_type = property(_plugin_layers_block_type)
         Qwen3NextConfig._sglang_qwen3_next_plugin_layer_types_patch = True
+    applied.append("layer_types")
 
-    return ["layer_types"]
+    if not getattr(
+        kv_cache_mixin_module,
+        "_sglang_qwen3_next_plugin_mamba_conv_dtype_patch",
+        False,
+    ):
+        original_init_memory_pool = (
+            kv_cache_mixin_module.ModelRunnerKVCacheMixin.init_memory_pool
+        )
+
+        def _patched_init_memory_pool(self, *args, **kwargs):
+            hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
+            text_config = (
+                hf_config.get_text_config()
+                if hasattr(hf_config, "get_text_config")
+                else hf_config
+            )
+            model_dtype = getattr(getattr(self, "model_config", None), "dtype", None)
+            if isinstance(text_config, Qwen3NextConfig) and model_dtype is not None:
+                text_config.torch_dtype = model_dtype
+                text_config.dtype = model_dtype
+                if not envs.SGLANG_MAMBA_CONV_DTYPE.is_set():
+                    if model_dtype is torch.float16:
+                        envs.SGLANG_MAMBA_CONV_DTYPE.set("float16")
+                    elif model_dtype is torch.bfloat16:
+                        envs.SGLANG_MAMBA_CONV_DTYPE.set("bfloat16")
+                    elif model_dtype is torch.float32:
+                        envs.SGLANG_MAMBA_CONV_DTYPE.set("float32")
+            return original_init_memory_pool(self, *args, **kwargs)
+
+        kv_cache_mixin_module.ModelRunnerKVCacheMixin.init_memory_pool = (
+            _patched_init_memory_pool
+        )
+        kv_cache_mixin_module._sglang_qwen3_next_plugin_mamba_conv_dtype_patch = True
+    applied.append("mamba_conv_dtype")
+
+    return applied

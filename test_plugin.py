@@ -110,7 +110,7 @@ def test_conv_backend_override_contract() -> None:
 def test_hybrid_gdn_conv_dtype_contract() -> None:
     prepare_env()
     if current_version_key() != "sglang_0_5_2":
-        print("~ 当前版本不要求 hybrid_gdn_params conv dtype 覆盖")
+        print("~ 当前版本不要求 hybrid_gdn_params 属性覆盖")
         return
     importlib.import_module("sglang_qwen3_next_plugin")
     from sglang_qwen3_next_plugin.versioning import get_active_variant_module_name
@@ -138,16 +138,25 @@ def test_hybrid_gdn_conv_dtype_contract() -> None:
 
 def test_model_runner_dtype_patch_contract() -> None:
     prepare_env()
-    if current_version_key() != "sglang_0_5_2":
-        print("~ 当前版本不要求 ModelRunner dtype patch")
-        return
     importlib.import_module("sglang_qwen3_next_plugin")
-    import sglang.srt.model_executor.model_runner as model_runner_module
+
+    if current_version_key() == "sglang_0_5_2":
+        import sglang.srt.model_executor.model_runner as model_runner_module
+
+        assert getattr(
+            model_runner_module, "_sglang_qwen3_next_plugin_dtype_patch", False
+        ), "ModelRunner.init_memory_pool 未打上 dtype 同步补丁"
+        print("✓ ModelRunner.init_memory_pool 已添加 hybrid_gdn dtype 同步补丁")
+        return
+
+    import sglang.srt.model_executor.model_runner_kv_cache_mixin as kv_cache_mixin_module
 
     assert getattr(
-        model_runner_module, "_sglang_qwen3_next_plugin_dtype_patch", False
-    ), "ModelRunner.init_memory_pool 未打上 dtype 同步补丁"
-    print("✓ ModelRunner.init_memory_pool 已添加 hybrid_gdn dtype 同步补丁")
+        kv_cache_mixin_module,
+        "_sglang_qwen3_next_plugin_mamba_conv_dtype_patch",
+        False,
+    ), "ModelRunnerKVCacheMixin.init_memory_pool 未打上 mamba conv dtype 同步补丁"
+    print("✓ ModelRunnerKVCacheMixin.init_memory_pool 已添加 mamba conv dtype 同步补丁")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,43 @@
 
 ## 记录格式
 
+### 0.2.1 - 2026-07-23
+- 发布说明：
+  - 在 `sglang 0.5.9` 变体中补充 YuLan-MoE Hybrid GDN checkpoint 的混合 dense/MoE MLP 层布局支持
+- 变更项：`0.5.9` 逐层 sparse MLP 判定
+  - 分类：P1 / checkpoint 结构定制
+  - 内容：
+    - `variants/sglang_0_5_9.py` 新增 `_is_sparse_mlp_layer()`
+    - decoder layer 不再只按全局 `num_experts > 0` 判断是否创建 `Qwen2MoeSparseMoeBlock`
+    - sparse 判定改为复用 HF 语义：`num_experts > 0`、`layer_id not in mlp_only_layers`、`(layer_id + 1) % decoder_sparse_step == 0`
+    - `LayerScatterModes` 的当前/前一/后一层 sparse 状态同步改为逐层计算
+  - 原因：
+    - YuLan-MoE checkpoint 设置 `num_experts=192`，但 `mlp_only_layers=[0, 1]`
+    - 权重索引显示第 0、1 层是普通 `mlp.gate_proj/up_proj/down_proj`，第 2 层起才是 `mlp.gate`、`mlp.experts.*` 与 shared expert
+    - 旧逻辑会把第 0、1 层错误建成 sparse MoE，导致结构与权重不匹配
+  - 升级复核：
+    - 若未来上游 SGLang Qwen3-Next 已原生按 `mlp_only_layers` / `decoder_sparse_step` 做逐层 MoE 判定，可删除该定制
+    - 保留 `num_experts=0` 非 MoE checkpoint 兜底语义
+- 变更项：`0.5.9` Hybrid GDN / Mamba conv cache dtype 同步
+  - 分类：P2 / 运行时兼容
+  - 内容：
+    - `compat/sglang_0_5_9.py` patch `ModelRunnerKVCacheMixin.init_memory_pool()`
+    - 在 Hybrid GDN cache 分配前同步 `Qwen3NextConfig.dtype` 与 `Qwen3NextConfig.torch_dtype`
+    - 当用户未显式设置 `SGLANG_MAMBA_CONV_DTYPE` 时，按 `model_config.dtype` 设置 Mamba conv cache dtype
+  - 原因：
+    - YuLan-MoE checkpoint 在 0.5.9 服务启动时被从 `torch.float32` downcast 到 `torch.float16`
+    - SGLang 0.5.9 的 `mamba2_state_dtype()` 默认将 conv cache 建成 `bfloat16`
+    - 真实 `/generate` 请求因此触发 `conv_states_.scalar_type() == input_type` runtime error
+  - 升级复核：
+    - 若未来 SGLang 原生让 Mamba conv cache dtype 跟随模型实际 dtype，可删除该 compat
+    - 若用户显式设置 `SGLANG_MAMBA_CONV_DTYPE`，插件不覆盖用户配置
+- 环境事实：
+  - 当前仓库 `.venv` 使用 `sglang==0.5.9`、`torch==2.9.1+cu128`、`flashinfer-python==0.6.3`、`sgl-kernel==0.3.21`
+  - 未安装 `vllm`，避免了历史 `vllm._C` ABI 冲突
+  - 本轮未新增 `sglang` 版本，因此未新增上游快照；继续使用既有 `upstream/sglang_0_5_9/`
+  - YuLan-MoE Hybrid GDN 在 2 张 H100 80GB、`tp=2` 下完成真实服务启动、生成和 logprob 验收
+  - 完整 runtime acceptance 返回 `ALL CHECKS PASSED`
+
 ### 0.2.0 - 2026-03-20
 - 发布说明：
   - 首个多版本 release
