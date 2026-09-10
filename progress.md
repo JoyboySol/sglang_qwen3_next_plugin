@@ -630,3 +630,83 @@
   - `sglang 0.5.2`：完整验收通过
   - `sglang 0.5.9`：完整验收通过
   - 项目级 skill 已根据本次真实适配经验更新
+
+### Phase 23: YuLan-MoE `iter_32780` 在 A800 上重新验收
+- 验收时间：`2026-08-02`
+- 环境事实：
+  - Python `3.11.14`
+  - `sglang==0.5.9`
+  - `torch==2.9.1`
+  - `flashinfer-python==0.6.3`
+  - `sgl-kernel==0.3.21`
+  - 未安装 `vllm`，没有重现历史 ABI 冲突
+- checkpoint：
+  - `/mnt/hdd/lvzhihao/hf_models/YuLan-MoE/iter_32780`
+  - 7 个 safetensors shard，总大小约 `63.465 GiB`
+  - `mlp_only_layers=[0, 1]`、`decoder_sparse_step=1`、`num_experts=192`
+  - 配置 `dtype=float32`，服务实际 downcast 到 `torch.float16`
+- 轻量回归：
+  - `python -m pytest tests/test_versioning.py -q`
+    - `11 passed`
+  - `python -m pytest tests/test_dispatcher_exports.py tests/test_compat_modules.py tests/test_variant_0_5_9_source.py tests/test_versioning.py -q`
+    - `23 passed`
+  - `python scripts/run_acceptance.py --skip-runtime`
+    - `ALL CHECKS PASSED`
+  - registry 解析到 `sglang_qwen3_next_plugin.variants.sglang_0_5_9.Qwen3NextForCausalLM`
+- 真实服务：
+  - 2 张 NVIDIA A800-SXM4-80GB，`tp=2`
+  - 使用 `--trust-remote-code --disable-cuda-graph`
+  - 开启 `--tool-call-parser qwen3_coder`，服务名为 `YuLan-MoE`
+  - 7 个 shard 全部加载，模型权重每卡约 `31.76 GB`
+  - Mamba conv/SSM cache 与 KV cache 分配成功，首个真实 `/generate` 返回 HTTP 200
+  - 没有重现 `conv_states_.scalar_type() == input_type` dtype 断言
+- README runtime 精度验收：
+  - generation：中文与英文 case 均 `PASS`
+  - logprob / 近似 lm loss：
+    - 中文 `avg_nll=4.9417`、`approx_ppl=140.0145`、8 tokens scored
+    - 英文 `avg_nll=3.0611`、`approx_ppl=21.3506`、12 tokens scored
+    - 两项均低于默认 `max_avg_nll=8.0`
+- OpenAI 兼容对话：
+  - `temperature=0.7`、`enable_thinking=false`
+  - 返回 HTTP 200，能正确回答 `2+3=5`
+- tool call 观测：
+  - `tool_choice=auto` 中英文请求都返回自然语言拒答，没有生成 `tool_calls`
+  - `tool_choice=required` 返回 HTTP 200 与 `finish_reason=tool_calls`
+  - `qwen3_coder` parser 成功解析 `get_current_weather({"city":"Shanghai"})`
+  - checkpoint 一次返回了两个重复 tool call；服务结构化链路可用，但模型的 auto 选择和调用去重能力仍需后续训练/评测
+- 本轮结论：
+  - 插件对该 YuLan-MoE checkpoint 的结构、dtype compat、生成和 logprob 验收通过
+  - 服务在 `127.0.0.1:30110` 保持运行，本轮不回收
+
+### Phase 24: 对齐 `YuLan-MoE-Base-jiuzhang` 的 vLLM 评测语义
+- 排查时间：`2026-09-09`
+- 对照输入：
+  - SGLang 预测：`opencompass/results/yulan_moe_base_jiuzhang/.../aime2024.json`
+  - vLLM 预测：`opencompass/results/yulan_moe_base_jiuzhang_changed/.../aime2024.json`
+  - vLLM 参考插件：`/mnt/ssd/lvzhihao/PostTrain/vllm_qwen3_next_plugin`
+- 已确认的差异：
+  - SGLang AIME 2024 得分 `18.33`，vLLM 得分 `55.00`
+  - SGLang 平均 completion tokens 约 `41216.98`，vLLM 约 `26064.92`
+  - SGLang 长度截断 `94/120`，vLLM 长度截断 `32/120`
+  - 两端 sampling 参数一致，vLLM 历史服务日志确认使用 BF16、TP2 和 expert parallel
+- 根因与修正：
+  - P1：旧 full-attention 路径无条件应用 RoPE，忽略 checkpoint 的 `attn_position_embedding_type="nope"`
+  - P1：旧 sparse-MoE 路径忽略 `moe_router_sqrt_gate=true`，使 54 个 MoE 层的组合权重都与 vLLM 不同
+  - 运行参数：SGLang `auto` 将 `dtype=float32` 选成 FP16；精度对照服务改为显式 `--dtype bfloat16`，不修改 checkpoint 配置
+- 代码变更：
+  - `variants/sglang_0_5_9.py` 新增 `Qwen3NextSparseMoeBlock` 和 sqrt-gate routing
+  - full-attention 层按 `attn_position_embedding_type` 条件创建、应用 RoPE
+  - `tests/test_variant_0_5_9_source.py` 增加两项回归断言
+- 轻量验证：
+  - `python -m py_compile sglang_qwen3_next_plugin/variants/sglang_0_5_9.py`：通过
+  - `pytest tests/test_variant_0_5_9_source.py -q`：`10 passed`
+  - `pytest tests/test_dispatcher_exports.py tests/test_compat_modules.py tests/test_variant_0_5_9_source.py tests/test_versioning.py -q`：`25 passed`
+  - `pytest -q`：`35 passed`
+- 真实服务验证：
+  - 修正后模型以 BF16、TP2、EP2 成功加载，`validate_generation.py` 两项通过
+  - `validate_logprob.py` 通过：中文 `avg_nll=4.2200`，英文 `avg_nll=3.0404`
+  - 同机 vLLM `0.18.1` 参考服务已确认加载同一 checkpoint 和 sqrt-gate 定制
+  - AIME 30 个唯一题面的 teacher-forcing 对照共覆盖 4061 个 prompt token
+  - 平均题面 NLL：SGLang `1.249944`，vLLM `1.224922`，平均差 `0.025022`
+  - 逐 token logprob 平均绝对差为 `0.128469`，贪心首 token 一致 `26/30`
+  - 仍有的小幅数值差异来自两端 GDN/MoE kernel 和并行归约路径，已不再呈现修正前的系统性模型语义偏移

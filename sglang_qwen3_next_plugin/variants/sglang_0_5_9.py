@@ -27,6 +27,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK, fused_topk
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -80,6 +81,42 @@ def _is_sparse_mlp_layer(config: Qwen3NextConfig, layer_id: int) -> bool:
     if decoder_sparse_step <= 0:
         raise ValueError(f"decoder_sparse_step must be positive: {decoder_sparse_step}")
     return (layer_id + 1) % decoder_sparse_step == 0
+
+
+class Qwen3NextSparseMoeBlock(Qwen2MoeSparseMoeBlock):
+    def __init__(
+        self,
+        layer_id: int,
+        config: Qwen3NextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(layer_id, config, quant_config, alt_stream, prefix)
+
+        if not getattr(config, "moe_router_sqrt_gate", False):
+            return
+
+        score_func = getattr(config, "moe_router_score_function", "softmax")
+
+        def sqrt_gate_routing(hidden_states, gating_output, topk, renormalize):
+            topk_weights, topk_ids = fused_topk(
+                hidden_states=hidden_states,
+                gating_output=gating_output,
+                topk=topk,
+                renormalize=renormalize,
+                scoring_func=score_func,
+            )
+            tiny = torch.finfo(topk_weights.dtype).tiny
+            return topk_weights.clamp_min(tiny).sqrt(), topk_ids
+
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            renormalize=config.norm_topk_prob,
+            layer_id=layer_id,
+            custom_routing_function=sqrt_gate_routing,
+            scoring_func=score_func,
+        )
 
 
 @triton.jit
@@ -521,7 +558,7 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.mlp = Qwen3NextSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -619,7 +656,15 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        self.attn_position_embedding_type = getattr(
+            config, "attn_position_embedding_type", "rope"
+        )
+        if self.attn_position_embedding_type not in ("rope", "nope"):
+            raise ValueError(
+                "attn_position_embedding_type must be 'rope' or 'nope', got "
+                f"{self.attn_position_embedding_type!r}"
+            )
+        self.rope_theta = getattr(config, "rope_theta", None) or 10000
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         if "rope_parameters" in config:
             self.rope_scaling = getattr(config, "rope_parameters", None)
@@ -632,16 +677,18 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=self.max_position_embeddings,
-            rope_scaling=self.rope_scaling,
-            base=self.rope_theta,
-            partial_rotary_factor=self.partial_rotary_factor,
-            is_neox_style=True,
-            dtype=torch.get_default_dtype(),  # see impl of get_rope
-        )
+        self.rotary_emb = None
+        if self.attn_position_embedding_type == "rope":
+            self.rotary_emb = get_rope(
+                head_size=self.head_dim,
+                rotary_dim=self.head_dim,
+                max_position=self.max_position_embeddings,
+                rope_scaling=self.rope_scaling,
+                base=self.rope_theta,
+                partial_rotary_factor=self.partial_rotary_factor,
+                is_neox_style=True,
+                dtype=torch.get_default_dtype(),  # see impl of get_rope
+            )
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -695,7 +742,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         )
 
         if self.is_layer_sparse:
-            self.mlp = Qwen2MoeSparseMoeBlock(
+            self.mlp = Qwen3NextSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -744,7 +791,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self.rotary_emb(positions, q, k)
+        if self.rotary_emb is not None:
+            q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
@@ -954,7 +1002,7 @@ class Qwen3NextForCausalLM(nn.Module):
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock)
+                if isinstance(layer.mlp, Qwen3NextSparseMoeBlock)
             }
         )
 

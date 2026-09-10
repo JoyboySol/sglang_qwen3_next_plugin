@@ -7,6 +7,43 @@
 
 ## 记录格式
 
+### Unreleased - 2026-09-09
+- 发布说明：
+  - 修正 `YuLan-MoE-Base-jiuzhang` 在 `sglang 0.5.9` 下与 vLLM 明显不一致的模型语义
+- 变更项：按 `attn_position_embedding_type` 启用 RoPE
+  - 分类：P1 / checkpoint 语义定制
+  - 内容：
+    - `Qwen3HybridAttentionDecoderLayer` 仅在配置值为 `rope` 时创建和应用 rotary embedding
+    - 显式接受 `rope` / `nope`，对其他值立即报错
+  - 原因：
+    - checkpoint 明确配置 `attn_position_embedding_type="nope"`、`rope_theta=null`
+    - 旧 SGLang 变体无条件应用 RoPE，与 checkpoint 自带 HF 实现及 vLLM `0.18.1` 插件都不一致
+  - 升级复核：
+    - 若未来上游 SGLang 原生支持 `attn_position_embedding_type`，可删除该定制
+- 变更项：实现 `moe_router_sqrt_gate`
+  - 分类：P1 / checkpoint 语义定制
+  - 内容：
+    - 新增 `Qwen3NextSparseMoeBlock`，保留 SGLang `Qwen2MoeSparseMoeBlock` 的专家和 shared expert 实现
+    - 在 `moe_router_sqrt_gate=true` 时，先按 `moe_router_score_function` 取 top-k 并归一化，再对 routing weight 开平方，且不再次归一化
+  - 原因：
+    - checkpoint 在 54 个 sparse MoE 层启用 `moe_router_sqrt_gate=true`
+    - 旧 SGLang 变体直接复用通用 `Qwen2MoeSparseMoeBlock`，完全忽略该配置
+    - 新路径与 `/mnt/ssd/lvzhihao/PostTrain/vllm_qwen3_next_plugin` 中已验证的 vLLM `0.18.1` 实现对齐
+  - 升级复核：
+    - 若上游 Qwen3-Next MoE block 开始原生消费 `moe_router_sqrt_gate`，用上游路由器替换该子类
+- 运行时精度要求：
+  - 不修改 checkpoint `config.json`
+  - 该 checkpoint 权重主体为 BF16，vLLM 评测也使用 BF16；SGLang 启动时需显式传入 `--dtype bfloat16`
+  - SGLang 对 `dtype=float32` 的 `auto` 会选择 FP16，不能用于与该 vLLM 结果做精度对照
+- 问题基线：
+  - 修正前 SGLang AIME 2024 得分 `18.33`，120 条中 94 条命中最大输出长度
+  - vLLM AIME 2024 得分 `55.00`，120 条中 32 条命中最大输出长度
+  - 两份评测使用同一 checkpoint 和相同 sampling 参数，差异不是 `config.json` 导致
+- 修正后数值对照：
+  - 同机 BF16、TP2、EP2 服务对 AIME 30 个唯一题面执行 teacher-forcing
+  - 4061 个 prompt token 上，SGLang/vLLM 平均题面 NLL 为 `1.249944` / `1.224922`，差值 `0.025022`
+  - 逐 token logprob 平均绝对差 `0.128469`，贪心首 token 一致 `26/30`
+
 ### 0.2.1 - 2026-07-23
 - 发布说明：
   - 在 `sglang 0.5.9` 变体中补充 YuLan-MoE Hybrid GDN checkpoint 的混合 dense/MoE MLP 层布局支持
@@ -43,6 +80,15 @@
   - 本轮未新增 `sglang` 版本，因此未新增上游快照；继续使用既有 `upstream/sglang_0_5_9/`
   - YuLan-MoE Hybrid GDN 在 2 张 H100 80GB、`tp=2` 下完成真实服务启动、生成和 logprob 验收
   - 完整 runtime acceptance 返回 `ALL CHECKS PASSED`
+- `2026-08-02` 重新验收记录：
+  - checkpoint：`/mnt/hdd/lvzhihao/hf_models/YuLan-MoE/iter_32780`
+  - 硬件：2 张 NVIDIA A800-SXM4-80GB，`tp=2`
+  - 轻量回归为 `11 passed` 与 `23 passed`，`run_acceptance.py --skip-runtime` 返回 `ALL CHECKS PASSED`
+  - 真实服务完成权重、Mamba cache 和 KV cache 分配，首个 `/generate` 请求成功，未重现 Mamba conv cache dtype 断言
+  - logprob 验收：中文 `avg_nll=4.9417`，英文 `avg_nll=3.0611`，均通过默认阈值 `8.0`
+  - OpenAI 对话在 `temperature=0.7` 下返回 HTTP 200 与可读中文结果
+  - 启用 `--tool-call-parser qwen3_coder` 后，`tool_choice=required` 能返回结构化 `tool_calls`
+  - checkpoint 在 `tool_choice=auto` 下未主动调用工具，强制调用时一次返回两个重复调用；这是模型行为层的残余问题，不影响插件运行时支持结论
 
 ### 0.2.0 - 2026-03-20
 - 发布说明：

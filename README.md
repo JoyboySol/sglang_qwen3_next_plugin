@@ -46,6 +46,7 @@ python -m sglang.launch_server \
 - `sglang 0.5.2` 仍需要仓库内的接入层兼容逻辑
 - `sglang 0.5.9` 已原生支持外部模型包发现
 - 若新环境中存在与当前 `torch` ABI 不兼容的 `vllm`，应先移除再做插件验收
+- `YuLan-MoE-Base-jiuzhang` 与 vLLM 精度对齐时必须显式使用 `--dtype bfloat16`；可用 `--tp 2 --ep-size 2` 对齐原评测的并行配置
 
 ## 当前支持状态
 
@@ -75,6 +76,8 @@ python -m sglang.launch_server \
    - `sglang 0.5.9`
      - `layer_types` compat
      - Hybrid GDN / Mamba conv cache dtype 同步
+     - full attention 支持 `attn_position_embedding_type=rope/nope`
+     - sparse MoE 支持 `moe_router_sqrt_gate`
      - 当前没有证据表明还需要继承 `0.5.2` 的 hybrid backend 强制切换 patch
 
 详细原因与升级复核点请看：
