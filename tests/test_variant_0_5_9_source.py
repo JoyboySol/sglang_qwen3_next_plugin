@@ -41,7 +41,7 @@ def test_variant_0_5_9_enables_qkv_bias() -> None:
         Path("sglang_qwen3_next_plugin/variants/sglang_0_5_9.py").read_text()
     )
 
-    assert "bias=True," in source
+    assert 'bias=getattr(config, "attention_bias", True),' in source
 
 
 def test_variant_0_5_9_skips_removed_qk_norm_weights() -> None:
@@ -90,3 +90,36 @@ def test_variant_0_5_9_supports_moe_router_sqrt_gate() -> None:
     assert 'getattr(config, "moe_router_sqrt_gate", False)' in source
     assert "topk_weights.clamp_min(tiny).sqrt()" in source
     assert "custom_routing_function=sqrt_gate_routing" in source
+
+
+def test_variant_0_5_9_supports_yulan_gated_rmsnorm() -> None:
+    source = Path("sglang_qwen3_next_plugin/variants/sglang_0_5_9.py").read_text()
+
+    assert "class Qwen3NextGatedRMSNorm(nn.Module)" in source
+    assert "self.rms_norm = RMSNorm(" in source
+    assert "self.w_down = nn.Linear(" in source
+    assert "self.w_up = nn.Linear(" in source
+    assert 'getattr(config, "norm_type", None) == "gated_rms"' in source
+    assert "getattr(config, \"final_gated_norm\", False)" in source
+    assert "self.norm = _build_qwen3_next_norm(config, final=True)" in source
+
+
+def test_variant_0_5_9_supports_yulan_soft_clamped_swiglu() -> None:
+    source = Path("sglang_qwen3_next_plugin/variants/sglang_0_5_9.py").read_text()
+
+    assert "class SoftClampedSiluAndMul(nn.Module)" in source
+    assert "torch.tanh(gate.float() / self.limit)" in source
+    assert "torch.tanh(up.float() / self.limit)" in source
+    assert "moe_runner_config.gemm1_clamp_limit = -float(clamp_value)" in source
+    assert "self.shared_expert.act_fn = SoftClampedSiluAndMul(clamp_value)" in source
+
+
+def test_variant_0_5_9_supports_yulan_router_and_logits_dtype_semantics() -> None:
+    source = Path("sglang_qwen3_next_plugin/variants/sglang_0_5_9.py").read_text()
+
+    assert "class Float32ReplicatedLinear(ReplicatedLinear)" in source
+    assert 'getattr(config, "moe_router_dtype", None) in ("fp32", "float32")' in source
+    assert "params_dtype=torch.float32" in source
+    assert "class Qwen3NextLogitsProcessor(LogitsProcessor)" in source
+    assert "logits = logits.clamp(" in source
+    assert "self.logits_processor = Qwen3NextLogitsProcessor(config)" in source

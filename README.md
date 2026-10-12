@@ -10,6 +10,7 @@
 - ✅ 主入口统一为 `SGLANG_EXTERNAL_MODEL_PACKAGE=sglang_qwen3_next_plugin`
 - ✅ 仓库按 `upstream / variants / compat / versioning` 分层组织
 - ✅ 已支持 checkpoint 显式 `layer_types`
+- ✅ `sglang 0.5.9` 已适配 `models/YuLan-MoE-128k` 的 gated norm、soft-clamped SwiGLU、FP32 router 与 logits clamp
 - ✅ 已完成真实服务级生成与 logprob 验收
 - ✅ 提供可复用的轻量验收与完整验收脚本
 
@@ -40,6 +41,18 @@ python -m sglang.launch_server \
   --tp 1
 ```
 
+YuLan-MoE-128k 已验证的双卡启动方式：
+
+```bash
+bash scripts/serve_yulan_moe_128k.sh
+```
+
+AIME 2024 单次采样、最大生成 32K 的后台评测：
+
+```bash
+bash scripts/run_eval_yulan_moe_128k_aime2024_nohup.sh
+```
+
 注意：
 
 - 环境变量必须在 Python 进程启动前设置
@@ -54,6 +67,7 @@ python -m sglang.launch_server \
   - 插件发现、registry 接管、自然语言生成、logprob 验收均已通过
 - `sglang 0.5.9`
   - 插件发现、registry 接管、真实服务启动、自然语言生成、logprob 验收均已通过
+  - `/mnt/yulan/lvzhihao/PostTrain/models/YuLan-MoE-128k` 已在两张 A100 80GB 上以 BF16、TP2/EP2 完成 128K 配置加载、生成和 logprob 验收
 
 ## 自定义修改
 
@@ -78,6 +92,7 @@ python -m sglang.launch_server \
      - Hybrid GDN / Mamba conv cache dtype 同步
      - full attention 支持 `attn_position_embedding_type=rope/nope`
      - sparse MoE 支持 `moe_router_sqrt_gate`
+   - YuLan-MoE-128k 支持 low-rank gated RMSNorm、soft-clamped SwiGLU、FP32 router 与最终 logits clamp
      - 当前没有证据表明还需要继承 `0.5.2` 的 hybrid backend 强制切换 patch
 
 详细原因与升级复核点请看：

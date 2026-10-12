@@ -7,6 +7,29 @@
 
 ## 记录格式
 
+### Unreleased - 2026-10-12
+- 发布说明：
+  - 为 `/mnt/yulan/lvzhihao/PostTrain/models/YuLan-MoE-128k` 补齐 `sglang 0.5.9` checkpoint 语义
+- 变更项：YuLan-MoE-128k gated RMSNorm
+  - 分类：P1 / checkpoint 结构定制
+  - 内容：decoder 的 input/post-attention norm 及 final norm 按配置构造 low-rank gated RMSNorm，参数名与 checkpoint 的 `rms_norm/w_down/w_up` 对齐
+  - 原因：旧变体只有普通 `RMSNorm`，会漏掉 checkpoint 中全部 gated norm 参数
+- 变更项：YuLan-MoE-128k 激活、router 与 logits 语义
+  - 分类：P1 / checkpoint 数值语义定制
+  - 内容：dense/shared/routed expert 使用双分支 tanh soft clamp；router projection 使用 FP32；保留 sqrt routing；最终 logits 按配置裁剪
+  - 原因：checkpoint 分别声明 `activation_func_clamp_*`、`moe_router_dtype`、`moe_router_sqrt_gate` 与 `final_logits_clamp_value`
+- 变更项：`sglang 0.5.9` soft clamp compat
+  - 分类：P2 / 运行时兼容
+  - 内容：复用 0.5.9 Triton MoE 的 clamp-limit 传递链，以负值作为插件私有 sentinel，仅对 YuLan 路径应用对称 tanh clamp；正值仍调用上游 hard clamp
+  - 原因：0.5.9 runner 已能传递 clamp limit，但只提供 hard-clamp helper
+- 验证状态：
+  - Python 编译、源码契约测试、checkpoint 配置和关键权重名检查已通过
+  - 使用 `slime/.venv` 中的 `sglang==0.5.9` 完整测试：`39 passed, 1 skipped`
+  - 两张 A100 80GB、BF16、TP2/EP2、完整 128K context 配置成功加载；每卡模型权重约 31.86GB
+  - 自然语言生成验收通过；中文/英文 logprob 样本平均 NLL 分别为 `3.5608` / `3.1270`
+  - `scripts/run_acceptance.py --host 127.0.0.1 --port 30110` 返回 `ALL CHECKS PASSED`
+  - FlashInfer warmup 需要保证目标 venv 的 `bin` 目录在 `PATH` 中，以便找到其 `ninja` 可执行文件
+
 ### Unreleased - 2026-09-09
 - 发布说明：
   - 修正 `YuLan-MoE-Base-jiuzhang` 在 `sglang 0.5.9` 下与 vLLM 明显不一致的模型语义

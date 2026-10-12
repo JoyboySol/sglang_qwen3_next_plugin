@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from torch.nn import functional as F
 
 from sglang.srt.configs.qwen3_next import HybridLayerType, Qwen3NextConfig
 from sglang.srt.environ import envs
@@ -86,5 +87,30 @@ def apply_runtime_compat() -> list[str]:
         )
         kv_cache_mixin_module._sglang_qwen3_next_plugin_mamba_conv_dtype_patch = True
     applied.append("mamba_conv_dtype")
+
+    # SGLang 0.5.9 already carries a clamp limit through the standard Triton
+    # MoE runner, but its helper implements GPT-OSS-style hard clipping.
+    # YuLan-MoE uses symmetric tanh clipping on both SwiGLU branches. Keep the
+    # upstream behavior for positive limits and reserve negative values as a
+    # plugin-private soft-clamp sentinel.
+    from sglang.srt.layers.moe.fused_moe_triton import fused_moe as fused_moe_module
+
+    if not getattr(
+        fused_moe_module, "_sglang_qwen3_next_plugin_soft_clamp_patch", False
+    ):
+        original_swiglu_clamp = fused_moe_module._swiglu_silu_clamp_mul
+
+        def _patched_swiglu_clamp(x, gemm1_limit):
+            if gemm1_limit < 0:
+                limit = -gemm1_limit
+                gate, up = x.chunk(2, dim=-1)
+                gate = limit * torch.tanh(gate.float() / limit)
+                up = limit * torch.tanh(up.float() / limit)
+                return (F.silu(gate) * up).to(x.dtype)
+            return original_swiglu_clamp(x, gemm1_limit)
+
+        fused_moe_module._swiglu_silu_clamp_mul = _patched_swiglu_clamp
+        fused_moe_module._sglang_qwen3_next_plugin_soft_clamp_patch = True
+    applied.append("soft_clamped_swiglu")
 
     return applied

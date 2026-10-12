@@ -1,5 +1,17 @@
 # SGLang Qwen3 Next Plugin 进度记录
 
+## 2026-10-12
+
+### YuLan-MoE-128k 双卡服务验收
+- checkpoint：`/mnt/yulan/lvzhihao/PostTrain/models/YuLan-MoE-128k`
+- 环境：`slime/.venv`，`sglang==0.5.9`，两张 NVIDIA A100-SXM4-80GB
+- 启动配置：BF16、TP2、EP2、`mem-fraction-static=0.85`、关闭 CUDA Graph
+- 完整 128K context 配置加载成功：每卡模型权重约 31.86GB，Mamba 与 KV cache 分配完成
+- 首次启动因 `PATH` 中找不到 venv 自带的 `ninja` 导致 FlashInfer warmup 失败；将 `slime/.venv/bin` 加入 `PATH` 后正常启动
+- 中文、英文生成均通过；logprob 平均 NLL 为 `3.5608` / `3.1270`
+- 完整 `run_acceptance.py` 返回 `ALL CHECKS PASSED`
+- 服务保留在 `127.0.0.1:30110`
+
 ## 2026-07-23
 
 ### YuLan-MoE Hybrid GDN 推理适配

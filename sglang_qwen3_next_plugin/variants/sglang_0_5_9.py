@@ -4,6 +4,7 @@ from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
@@ -23,6 +24,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -72,6 +74,8 @@ apply_runtime_compat()
 
 
 def _is_sparse_mlp_layer(config: Qwen3NextConfig, layer_id: int) -> bool:
+    if layer_id >= config.num_hidden_layers:
+        return False
     if getattr(config, "num_experts", 0) <= 0:
         return False
     if layer_id in getattr(config, "mlp_only_layers", []):
@@ -81,6 +85,86 @@ def _is_sparse_mlp_layer(config: Qwen3NextConfig, layer_id: int) -> bool:
     if decoder_sparse_step <= 0:
         raise ValueError(f"decoder_sparse_step must be positive: {decoder_sparse_step}")
     return (layer_id + 1) % decoder_sparse_step == 0
+
+
+class SoftClampedSiluAndMul(nn.Module):
+    """SwiGLU with the symmetric tanh clamp used by YuLan-MoE."""
+
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = float(limit)
+
+    def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = self.limit * torch.tanh(gate.float() / self.limit)
+        up = self.limit * torch.tanh(up.float() / self.limit)
+        return (F.silu(gate) * up).to(gate_up.dtype)
+
+
+class Qwen3NextGatedRMSNorm(nn.Module):
+    """Checkpoint-compatible low-rank gated RMSNorm used by YuLan-MoE."""
+
+    def __init__(self, config: Qwen3NextConfig):
+        super().__init__()
+        self.rms_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        rank = getattr(config, "gated_norm_rank", 16)
+        self.w_down = nn.Linear(config.hidden_size, rank, bias=False)
+        self.w_up = nn.Linear(
+            rank,
+            config.hidden_size,
+            bias=getattr(config, "gated_norm_up_bias", True),
+        )
+        self.gate_scale = getattr(config, "gated_norm_gate_scale", 1.0)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ):
+        if post_residual_addition is not None:
+            x = x + post_residual_addition
+        if residual is not None:
+            x = x + residual
+            residual = x
+        normalized = self.rms_norm(x)
+        gate = self.w_up(F.silu(self.w_down(normalized)))
+        output = normalized * torch.sigmoid(gate * self.gate_scale)
+        return output if residual is None else (output, residual)
+
+
+def _build_qwen3_next_norm(
+    config: Qwen3NextConfig, *, final: bool = False
+) -> nn.Module:
+    use_gated_norm = getattr(config, "norm_type", None) == "gated_rms" and (
+        not final or getattr(config, "final_gated_norm", False)
+    )
+    if use_gated_norm:
+        return Qwen3NextGatedRMSNorm(config)
+    return RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+
+class Float32ReplicatedLinear(ReplicatedLinear):
+    """Run the router projection in FP32 without changing its public API."""
+
+    def forward(self, x: torch.Tensor):
+        return super().forward(x.float())
+
+
+class Qwen3NextLogitsProcessor(LogitsProcessor):
+    def __init__(self, config: Qwen3NextConfig):
+        super().__init__(config)
+        self.final_logits_clamp_value = getattr(
+            config, "final_logits_clamp_value", None
+        )
+
+    def _compute_lm_head(self, *args, **kwargs):
+        logits = super()._compute_lm_head(*args, **kwargs)
+        if self.final_logits_clamp_value is not None:
+            logits = logits.clamp(
+                -self.final_logits_clamp_value, self.final_logits_clamp_value
+            )
+        return logits
 
 
 class Qwen3NextSparseMoeBlock(Qwen2MoeSparseMoeBlock):
@@ -93,6 +177,32 @@ class Qwen3NextSparseMoeBlock(Qwen2MoeSparseMoeBlock):
         prefix: str = "",
     ) -> None:
         super().__init__(layer_id, config, quant_config, alt_stream, prefix)
+
+        if getattr(config, "moe_router_dtype", None) in ("fp32", "float32"):
+            self.gate = Float32ReplicatedLinear(
+                config.hidden_size,
+                config.num_experts,
+                bias=getattr(config, "router_bias", False),
+                params_dtype=torch.float32,
+                quant_config=None,
+                prefix=add_prefix("gate", prefix),
+            )
+
+        clamp_value = getattr(config, "activation_func_clamp_value", None)
+        clamp_mode = getattr(config, "activation_func_clamp_mode", None)
+        if clamp_value is not None:
+            if clamp_mode != "soft":
+                raise ValueError(
+                    "Qwen3-Next activation_func_clamp_mode supports only "
+                    f"'soft', got {clamp_mode!r}"
+                )
+            # A negative limit is a private sentinel: 0.5.9 propagates this
+            # field to its Triton runner, and our compat wrapper interprets
+            # only negative values as YuLan's soft clamp. Positive values keep
+            # the upstream hard-clamp behavior used by other model families.
+            self.experts.moe_runner_config.gemm1_clamp_limit = -float(clamp_value)
+            if self.shared_expert is not None:
+                self.shared_expert.act_fn = SoftClampedSiluAndMul(clamp_value)
 
         if not getattr(config, "moe_router_sqrt_gate", False):
             return
@@ -573,10 +683,11 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+            clamp_value = getattr(config, "activation_func_clamp_value", None)
+            if clamp_value is not None:
+                self.mlp.act_fn = SoftClampedSiluAndMul(clamp_value)
+        self.input_layernorm = _build_qwen3_next_norm(config)
+        self.post_attention_layernorm = _build_qwen3_next_norm(config)
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
@@ -695,7 +806,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
             self.total_num_kv_heads,
-            bias=True,
+            bias=getattr(config, "attention_bias", True),
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
@@ -757,10 +868,11 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+            clamp_value = getattr(config, "activation_func_clamp_value", None)
+            if clamp_value is not None:
+                self.mlp.act_fn = SoftClampedSiluAndMul(clamp_value)
+        self.input_layernorm = _build_qwen3_next_norm(config)
+        self.post_attention_layernorm = _build_qwen3_next_norm(config)
 
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
@@ -887,7 +999,7 @@ class Qwen3NextModel(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = _build_qwen3_next_norm(config, final=True)
         self.infer_count = 0
 
         # For EAGLE3 support
@@ -994,7 +1106,7 @@ class Qwen3NextForCausalLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = Qwen3NextLogitsProcessor(config)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
